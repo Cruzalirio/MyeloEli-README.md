@@ -1,0 +1,544 @@
+---
+title: "ElianaBayes"
+format: html
+editor: visual
+---
+
+# Librerias
+
+```{r}
+#| warning: false
+library(tidyverse)
+library(readxl)
+library(spBayesSurv)
+library(survival)
+library(coda)
+library(car)
+library(mnorm)
+library(ldsr)
+library(LaplacesDemon)
+library(SurvMetrics)
+library(survivalROC)
+library(survAUC)
+```
+
+## Funciones para el modelo
+
+```{r}
+STheta <- function(t, theta){
+  t1 = theta[1]
+  t2 = theta[2]
+  St = exp(-(exp(t1)*t)^(exp(t2)))
+  return(St)
+}
+
+S0t <- function(t, theta, w){
+  L = length(w)
+  suma=0
+  for(i in 1:L){
+    suma = suma + w[i]*pbeta(STheta(t=t, theta = theta), i, L-i+1)
+  }
+  return(suma)
+}
+
+
+f0t <- function(t, theta, w){
+  L = length(w)
+  t1 = theta[1]
+  t2 = theta[2]
+  suma=0
+  for(i in 1:L){
+    suma = suma + w[i]*dbeta(STheta(t=t, theta = theta), i, L-i+1)*
+      exp(-(exp(t1)*t)^(exp(t2)))* (exp(t1))^(exp(t2))*exp(t2)*t^(exp(t2)-1)
+  }
+  return(suma)
+}
+
+
+CIndex = function(Y, Delta, eta){
+  n=length(Y)
+  CINum = numeric(n)
+  CIDen = numeric(n)
+  for(i in 1:length(Y)){
+    CINum[i] = length(Y[Y[i]<Y & eta[i]>eta & Delta[i]==1 ])
+    CIDen[i] = length(Y[Y[i]<Y & Delta[i]==1])
+  }
+  return(sum(CINum)/sum(CIDen))
+}
+
+GHIndex = function(eta){
+  n=length(eta)
+  GH = numeric(n)
+  for(i in 1:n){
+    GH[i] = sum(as.numeric(eta[i]>eta)/(1+exp(eta-eta[i])))
+  }
+  return(2*sum(GH)/(n*(n-1)))
+}
+
+medianaS0t = function(sobrevida, tiempos){
+  mediana = min(tiempos[sobrevida>0.5])
+  return(mediana)
+  }
+```
+
+## Carga de datos
+
+```{r}
+setwd("C:/Users/UIB/OneDrive - Universitat de les Illes Balears/Documentos/2024/Eliana")
+Arkansas <- read_excel("Arkansas.xlsx") 
+
+Arkansas$BMPC = as.numeric(Arkansas$BMPC)
+Arkansas$ASPC = as.numeric(Arkansas$ASPC)
+Arkansas = Arkansas %>% filter(OS_Time>0)
+
+modelo = survreg(Surv(OS_Time, OS_Censor) ~ PROT + 
+    AGE + SEX + RACE + ISOTYPE + B2M + CRP + CREAT + LDH + ALB +
+    HGB + ASPC + BMPC + MRI+ 
+    Cyto_Abn, data=Arkansas, dist='weibull')
+
+AUCCox = AUC.uno(modelo$y, modelo$y, -predict(modelo), times=c(24,seq(10,100,10)))
+AUCCox
+
+
+ArkansasUmb = Arkansas %>% mutate(B2MBR = ifelse(B2M<3.5, 1, 0),
+                                  B2AR = ifelse(B2M>5.5, 1, 0),
+                                  ALBAR = ifelse(ALB<3.5, 1, 0),
+                                  LDHBR = ifelse(LDH <180, 1, 0))
+
+modeloUmb = survreg(Surv(OS_Time, OS_Censor) ~  B2MBR +B2AR+ALBAR+LDHBR+  Cyto_Abn,data=ArkansasUmb, dist='weibull')
+
+AUCCox = AUC.uno(modelo$y, modelo$y, -predict(modeloUmb), times=seq(10,100,10))
+AUCCox
+
+
+modeloBayes =  survregbayes(Surv(OS_Time, OS_Censor) ~ PROT + 
+    AGE + SEX + RACE + ISOTYPE + B2M + CRP + CREAT + LDH + ALB + 
+    HGB + ASPC + BMPC + MRI  +  
+    Cyto_Abn, data=Arkansas, dist='weibull', selection = TRUE)
+
+
+```
+
+```{r}
+### AUC de uno 
+AUCCox = AUC.uno(modelo$y, modelo$y, -predict(modelo), times=seq(10,90,10))
+AUCCox
+
+
+theta0 = modeloBayes$theta.scaled
+w = modeloBayes$weight
+beta = modeloBayes$beta.scaled
+XObs = modeloBayes$X.scaled %*%apply(beta, 1, mean)
+AUCBayes = AUC.uno(modelo$y, modelo$y, XObs, times=seq(10,90,10))
+AUCBayes
+```
+
+```{r}
+t(t(rowSums(modeloBayes$gamma)/2000)) %>%  as.data.frame() %>% write.csv2()
+summary(modelo)$table %>% write.csv2()
+summary(modeloBayes)$coef %>% write.csv2()
+```
+
+## Pintar las curvas de sobrevida
+
+```{r}
+### Sobrevida base
+
+theta0 = modeloBayes$theta.scaled
+w = modeloBayes$weight
+
+tiempos = seq(0,400, 1)
+sobrevida = S0t(t = tiempos, w = apply(w, 1,mean), theta = apply(theta0, 1, mean))
+
+plot(tiempos, sobrevida, type="l", main="Base")
+
+
+### 
+beta = modeloBayes$beta.scaled
+XObs = modeloBayes$X.scaled %*%apply(beta, 1, mean)
+sobreX =  S0t(t = tiempos*exp(-XObs[3]), w = apply(w, 1,mean), theta = apply(theta0, 1, mean))
+
+lines(x=tiempos, sobreX, col="red")
+
+CoxSnell = as.numeric(modeloBayes$Surv.cox.snell)[1:nrow(modeloBayes$X)]
+Vida =as.numeric(modeloBayes$terms$`Surv(OS_Time, OS_Censor)`)[1:nrow(modeloBayes$X)]
+delta = as.numeric(modeloBayes$terms$`Surv(OS_Time, OS_Censor)`)[(nrow(modeloBayes$X)+1): (2*nrow(modeloBayes$X))]
+CoxSnell = CoxSnell+ifelse(delta==1,1,0)
+
+#plot(exp(XObs), CoxSnell)
+
+```
+
+```{r}
+DetMediana = function(Sobrevida, tiempos) max(tiempos[Sobrevida>0.5])
+#B2M = seq(0,50, 0.1)
+tiempos = seq(0,400, 1)
+Mediana = numeric(length(XObs))
+MedianaCox = Mediana
+for(ii in 1:length(XObs)){
+  sobrevidaBayes = S0t(t = exp(XObs[ii])*tiempos, w = apply(w, 1,mean), theta = apply(theta0, 1, mean))
+  Mediana[ii] = DetMediana(sobrevidaBayes, tiempos) 
+  sobrevidaCox = S0t(t = exp(-modelo$linear.predictors[ii])*tiempos, w = rep(1/5,5), theta = c(modelo$coefficients[1], -log(modelo$scale)))
+  MedianaCox[ii] = DetMediana(sobrevidaCox, tiempos) 
+}
+
+datosPred = data.frame(Vida, delta, Mediana, MedianaCox) %>% 
+  mutate(Error = Mediana-Vida,
+         Error = ifelse(delta == 0 & Error>0, 0, Error),
+         MAPE = abs(Error/Vida))
+
+mean(datosPred$MAPE)
+```
+
+## Descriptivo
+
+```{r}
+Arkansas %>% group_by(OS_Censor) %>% count()
+```
+
+```{r}
+SinEstimar = ArkansasImp[ rowSums(is.na(Arkansas))>0,]
+sum(SinEstimar$OS_Censor>0)
+```
+
+## Modelo Bayesiano
+
+```{r}
+sumBayes = summary(modeloBayes)
+sumCox = summary(modelo)
+round(sumBayes$coeff, 4)
+write.csv2(sumBayes$coeff)
+```
+
+```{r}
+tablaCox = data.frame(sumCox$table)
+tablaCox$Value = -tablaCox$Value
+tablaCox$IC95Low = tablaCox$Value-1.96*tablaCox$Std..Error
+tablaCox$IC95Upp = tablaCox$Value+1.96*tablaCox$Std..Error
+
+write.csv2(tablaCox)
+```
+
+## Indices de concordancia datos completo
+
+```{r}
+
+etaBayes = as.numeric(modeloBayes$X %*% as.matrix(modeloBayes$coefficients)[1:ncol(modeloBayes$X.scaled)])
+
+etaCox = -modelo$linear.predictors
+Y = as.numeric(modeloBayes$terms$`Surv(OS_Time, OS_Censor)`)[1:nrow(modeloBayes$X.scaled)]
+
+Delta = as.numeric(modeloBayes$terms$`Surv(OS_Time, OS_Censor)`)[(nrow(modeloBayes$X.scaled)+1): (2*nrow(modeloBayes$X.scaled))]
+
+CIndex(Y, Delta, etaBayes)
+CIndex(Y, Delta, etaCox)
+
+GHIndex(etaBayes)
+GHIndex(etaCox)
+```
+
+```{r}
+
+Cindex(Surv(Y, Delta), 1-etaBayes)
+
+Cindex(Surv(Y, Delta), 1-etaCox)
+
+```
+
+## Indices de concordancia
+
+```{r}
+etaBayes = as.numeric(modeloBayesUmb$X %*% as.matrix(modeloBayesUmb$coefficients)[1:ncol(modeloBayesUmb$X.scaled)])
+
+etaCox = -modeloUmb$linear.predictors
+Y = as.numeric(modeloBayesUmb$terms$`Surv(OS_Time, OS_Censor)`)[1:nrow(modeloBayesUmb$X.scaled)]
+
+Delta = as.numeric(modeloBayesUmb$terms$`Surv(OS_Time, OS_Censor)`)[(nrow(modeloBayesUmb$X.scaled)+1): (2*nrow(modeloBayesUmb$X.scaled))]
+
+CIndex(Y, Delta, etaBayes)
+CIndex(Y, Delta, etaCox)
+
+GHIndex(etaBayes)
+GHIndex(etaCox)
+```
+
+# Datos faltantes
+
+```{r}
+
+rellePerdi = function(X,mu, sigma, lambda){
+  p = ncol(X)
+  n = nrow(X)
+  X_Rell = X %>% data.frame()
+  XIndFalta = is.na(X)
+  XCompl = X %>% na.exclude() %>% data.frame()
+  Y = X %>% data.frame()
+  for(jj in 1:p){
+    Y[,jj] <- ((Y[,jj])^lambda[jj]-1)/lambda[jj]
+  }
+  for(ii in 1:n){
+    posPerd = (1:p)[XIndFalta[ii,]]
+    if(length(posPerd)>0){
+      posComp = (1:p)[!XIndFalta[ii,]]
+      mu_perd = mu[posPerd]
+      mu_obs = mu[posComp]
+      lambdaPer = lambda[posPerd]
+      y_obs = Y[ii,posComp]
+      if(length(posPerd)==1){
+        max_y = max(na.exclude(Y[,posPerd]))
+        min_y = min(na.exclude(Y[,posPerd]))
+      }else{
+        max_y = apply(na.exclude(Y[,posPerd]),2, max)
+        min_y = apply(na.exclude(Y[,posPerd]),2, min)
+      }
+      sigma11 = sigma[posPerd, posPerd]
+      sigma22 = sigma[posComp, posComp]
+      sigma12 = sigma[posPerd, posComp]
+      sigma21 = sigma[posComp, posPerd]
+      muYPdadoYO = mu_perd + sigma12%*%solve(sigma22)%*%t(y_obs-mu_obs)
+      sigmaYPdadoYO = sigma11 + sigma12%*%solve(sigma22)%*%sigma21
+      y_sim = mnorm::rmnorm(n=1, mean=muYPdadoYO, sigma = sigmaYPdadoYO)
+      for(kk in 1:length(y_sim)){
+        y_sim[kk] = min(y_sim[kk], max_y[kk])
+        y_sim[kk] = max(y_sim[kk], min_y[kk])
+      }
+      x_sim = (lambdaPer*y_sim+1)^(1/lambdaPer)
+      X_Rell[ii, posPerd] = x_sim
+    }
+  }
+  for(jj in 1:p){
+    Y[,jj] <- ((X_Rell[,jj])^lambda[jj]-1)/lambda[jj]
+  }
+  return(list("X"=X_Rell, "Y"=Y))
+}
+
+
+
+
+logLike = function(XRell, lambda, mu, sigma){
+ XRell = XRell
+ n= nrow(XRell)
+ p= ncol(XRell)
+ Lambda = matrix(lambda, ncol=p, nrow=n, byrow=TRUE)
+ YRell = (XRell^Lambda-1)/Lambda
+ loglik = sum(mnorm::dmnorm(as.matrix(YRell), mean=mu, sigma = sigma, log=TRUE)$den+
+   rowSums((Lambda-1)*log(XRell)))
+ return(loglik)
+}
+
+
+MHmcmc = function(X, nsim=500, epsilon=0.01, l0=100,mul0=0,
+                  lambda0=100, m0=0,v0=5, Psi0 = NULL, kl=1){
+  p=ncol(X)
+  n = nrow(X)
+  X = X+epsilon
+  XIndFalta = is.na(X)
+  XCompl = X %>% na.exclude() %>% data.frame()
+  BoxCoxX = powerTransform(X)
+  lambdaMLE = BoxCoxX$lambda
+  sigmaLambdaMLE = BoxCoxX$invHess
+  Y = X %>% data.frame()
+  Lambda = matrix(lambdaMLE, ncol=p, nrow=n, byrow=TRUE)
+  Y = (X^Lambda-1)/Lambda
+  YCompl = Y %>% na.exclude() %>% data.frame()
+  muIMLE = colSums(YCompl)/nrow(YCompl)
+  sigmamuMLE = var(YCompl)/nrow(YCompl)
+  sigmaMLE = var(YCompl)
+  X_perdMCMC = matrix(0, ncol = sum(XIndFalta), nrow=nsim)
+  muMCMC = matrix(muIMLE, ncol=p, nrow=nsim, byrow = TRUE)
+  lambdaMCMC = matrix(lambdaMLE, ncol=p, nrow=nsim, byrow = TRUE)
+  sigmaMCMC = matrix(as.numeric(sigmaMLE), ncol=p*p, nrow=nsim, byrow = TRUE)
+  XRell = rellePerdi(X, mu=muMCMC[1,],
+                     sigma=sigmaMLE,
+                     lambda = lambdaMCMC[1,])
+  X_perdMCMC[1, ] = XRell$X[XIndFalta]
+  sigmaTemp = sigmaMLE
+  for(repe in 2:nsim){
+    
+    sigmaLambda = kl*sigmaLambdaMLE*(repe<=l0)+
+      (var(lambdaMCMC[1:(repe-1),])+10e-10*diag(p))*(repe>l0)
+    lambda_prop = mnorm::rmnorm(n=1, mean=lambdaMCMC[repe-1,],
+                                sigma = sigmaLambda)
+    logprob_lambda = logLike(XRell = XRell$X, lambda=lambdaMCMC[(repe-1),],
+                             mu=muMCMC[repe-1,], 
+                             sigma=sigmaTemp)+
+      (-0.5*(lambdaMCMC[repe-1,]-rep(mul0,p))%*%
+         solve(lambda0*diag(1,p))%*% 
+         t(t((lambdaMCMC[repe-1,]-rep(mul0,p)))))
+    logprob_lambda_prop = logLike(XRell = XRell$X, lambda=lambda_prop,
+                                  mu=muMCMC[repe-1,], 
+                                  sigma=sigmaTemp)+
+      (-0.5*(lambda_prop-rep(mul0,p))%*%
+         solve(lambda0*diag(1,p))%*% t((lambda_prop-rep(mul0,p))))
+    diffProb = logprob_lambda_prop-logprob_lambda
+    if(is.nan(diffProb)){diffProb=0}
+    if(runif(1) < exp(diffProb)){
+      lambdaMCMC[repe,] = lambda_prop
+    }else{
+      lambdaMCMC[repe,] = lambdaMCMC[(repe-1),]
+    }
+    
+      ### Para mu
+      if(is.null(Psi0)){
+        Psi0 = 10e-4*diag(1,p)
+        V0 = 10e4*diag(1,p)
+      }
+      mu0 = rep(m0,p)
+      sigmaTemp = matrix(sigmaMCMC[(repe-1),], ncol=p, nrow=p, byrow = TRUE)
+      VV = solve(solve(V0)+n*solve(sigmaTemp))
+      muN = VV%*%(solve(V0)%*%t(t(mu0))+n*solve(sigmaTemp)%*%t(t(colSums(XRell$Y)/nrow(XRell$Y))))
+      muMCMC[repe,] = mnorm::rmnorm(n=1, mean=muN, sigma = VV)
+      nu = v0+n
+      RSS = (crossprod(as.matrix(XRell$Y)-matrix(muMCMC[repe,], ncol=p, nrow=n, byrow=TRUE)))
+      Psi = Psi0 + RSS
+      sigmaTemp = LaplacesDemon::rinvwishart(nu = nu, S=Psi)
+      sigmaMCMC[repe, ] = as.numeric(sigmaTemp)
+      ### Para Lambda 
+      ## Para XRell
+      XRell = rellePerdi(X, mu=muMCMC[repe,],
+                         sigma=sigmaTemp,
+                         lambda = lambdaMCMC[repe,])
+      X_perdMCMC[repe, ] = XRell$X[XIndFalta]
+      if(repe%%10==0){print(repe)}
+  }
+  return(list("lambda"=lambdaMCMC, "XPerd"=X_perdMCMC,
+              "mu"=muMCMC, "Sigma"=sigmaMCMC,
+              "XFalta"=XIndFalta))
+}
+
+```
+
+```{r}
+setwd("C:/Users/UIB/OneDrive - Universitat de les Illes Balears/Documentos/2024/Eliana")
+Arkansas <- read_excel("Arkansas.xlsx") 
+
+Arkansas$BMPC = as.numeric(Arkansas$BMPC)
+Arkansas$ASPC = as.numeric(Arkansas$ASPC)
+
+Arkansas = Arkansas %>% filter(OS_Time>0)
+Base = Arkansas %>% dplyr::select(OS_Time, OS_Censor, PROT, AGE, SEX, RACE, 
+                                  ISOTYPE, B2M, CRP, CREAT,LDH, ALB, HGB, ASPC, 
+                                  BMPC, MRI) 
+load(file="BoxCoxBayes.RData")
+Y = Base$OS_Time
+Delta = Base$OS_Censor
+X = Base[, 3:(ncol(Base))] %>%  dplyr::select(where(is.numeric))
+```
+
+```{r}
+perdido = 1
+X_media =X
+X_mediana = X
+p = ncol(X)
+n = nrow(X)
+for(j in 1:p){
+  for(i in 1:n){
+    if(is.na(X[i,j])){
+      X_media[i,j]=(mean(Prueba1$XPerd[,perdido])-0.1)
+      X_mediana[i,j]=(median(Prueba1$XPerd[,perdido])-0.1)
+      print(cbind(i,j))
+      perdido=perdido+1
+    }
+  }
+}
+```
+
+```{r}
+
+ArkansasImp = Arkansas %>% 
+  dplyr::select(OS_Time, OS_Censor, PROT,SEX, RACE, ISOTYPE,Cyto_Abn, CPR1) %>% 
+  cbind(X_mediana) %>% mutate(ISOTYPE=ifelse(is.na(ISOTYPE), "Nonsecretory", ISOTYPE))
+
+modeloBayesNAMediana =  survregbayes(Surv(OS_Time, OS_Censor) ~ PROT + 
+    AGE + SEX + RACE + ISOTYPE + B2M + CRP + CREAT + LDH + ALB + 
+    HGB + ASPC + BMPC + MRI  + 
+    Cyto_Abn, data=ArkansasImp, dist='weibull', selection = TRUE)
+```
+
+```{r}
+sumBN = summary(modeloBayesNAMediana)
+```
+
+```{r}
+etaBayesNAMediana = as.numeric(modeloBayesNAMediana$X %*% as.matrix(modeloBayesNAMediana$coefficients)[1:ncol(modeloBayesNAMediana$X.scaled)])
+
+Y = as.numeric(modeloBayesNAMediana$terms$`Surv(OS_Time, OS_Censor)`)[1:nrow(modeloBayesNAMediana$X.scaled)]
+
+Delta = as.numeric(modeloBayesNAMediana$terms$`Surv(OS_Time, OS_Censor)`)[(nrow(modeloBayesNAMediana$X.scaled)+1): (2*nrow(modeloBayesNAMediana$X.scaled))]
+
+CIndex(Y, Delta, etaBayesNAMediana)
+
+GHIndex(etaBayesNAMediana)
+```
+
+```{r}
+ t(t(rowSums(modeloBayesNAMediana$gamma)/2000)) %>%  as.data.frame() %>% write.csv2()
+ summary(modeloBayesNAMediana)$coef %>% write.csv2()
+```
+
+## Datos faltantes KNN
+
+```{r}
+library(VIM)
+setwd("C:/Users/UIB/OneDrive - Universitat de les Illes Balears/Documentos/2024/Eliana")
+Arkansas <- read_excel("Arkansas.xlsx")
+
+Arkansas$BMPC = as.numeric(Arkansas$BMPC)
+Arkansas$ASPC = as.numeric(Arkansas$ASPC)
+Base = Arkansas %>% dplyr::select(OS_Time, OS_Censor, PROT, AGE, SEX, RACE, 
+                                  ISOTYPE, B2M, CRP, CREAT,LDH, ALB, HGB, ASPC, 
+                                  BMPC, MRI) 
+load(file="BoxCoxBayes.RData")
+Y = Base$OS_Time
+Delta = Base$OS_Censor
+X = Base[, 3:(ncol(Base))] %>%  dplyr::select(where(is.numeric))
+XNuevaKnn = kNN(X)
+ArkansasImp = Arkansas %>% 
+  dplyr::select(OS_Time, OS_Censor, PROT,SEX, RACE, ISOTYPE,Cyto_Abn, CPR1) %>% 
+  cbind(XNuevaKnn[names(X)]) %>% mutate(ISOTYPE=ifelse(is.na(ISOTYPE), "Nonsecretory", ISOTYPE)) %>% filter(OS_Time>0)
+
+modeloCoxNA = survreg(Surv(OS_Time, OS_Censor) ~ PROT + 
+    AGE + SEX + RACE + ISOTYPE + B2M + CRP + CREAT + LDH + ALB + 
+    HGB + ASPC + BMPC + MRI  + 
+    Cyto_Abn, data=ArkansasImp, dist='weibull')
+```
+
+```{r}
+etaCox = -modeloCoxNA$linear.predictors
+Y = ArkansasImp$OS_Time
+
+Delta = ArkansasImp$OS_Censor
+
+CIndex(Y, Delta, etaCox)
+
+GHIndex(etaCox)
+```
+
+```{r}
+sumCox = summary(modeloCoxNA)
+tablaCox = data.frame(sumCox$table)
+tablaCox$Value = -tablaCox$Value
+tablaCox$IC95Low = tablaCox$Value-1.96*tablaCox$Std..Error
+tablaCox$IC95Upp = tablaCox$Value+1.96*tablaCox$Std..Error
+
+
+write.csv2(round(tablaCox,10))
+```
+
+```{r}
+### AUC de uno 
+
+AUCCox = AUC.uno(modeloCoxNA$y, modeloCoxNA$y, -predict(modeloCoxNA),
+                 times=seq(10,100,10))
+AUCCox
+
+theta0 = modeloBayesNAMediana$theta.scaled
+w = modeloBayesNAMediana$weight
+beta = modeloBayesNAMediana$beta.scaled
+XObs = modeloBayesNAMediana$X.scaled %*%apply(beta, 1, mean)
+
+AUCBayes = AUC.uno(modeloCoxNA$y, modeloCoxNA$y, XObs, times=seq(10,100,10))
+AUCBayes
+
+
+```
