@@ -1,0 +1,284 @@
+---
+title: "ACHO_NAs"
+format: pdf
+editor: visual
+---
+
+### Librerias
+
+```{r}
+#| warning: false
+library(tidyverse)
+library(readxl)
+library(spBayesSurv)
+library(survival)
+library(coda)
+library(car)
+library(mnorm)
+library(ldsr)
+library(LaplacesDemon)
+library(SurvMetrics)
+library(survivalROC)
+library(survAUC)
+library(flexsurv)
+library(survminer)
+```
+
+### Funciones
+
+```{r}
+STheta <- function(t, theta){
+  t1 = theta[1]
+  t2 = theta[2]
+  St = exp(-(exp(t1)*t)^(exp(t2)))
+  return(St)
+}
+
+S0t <- function(t, theta, w){
+  L = length(w)
+  suma=0
+  for(i in 1:L){
+    suma = suma + w[i]*pbeta(STheta(t=t, theta = theta), i, L-i+1)
+  }
+  return(suma)
+}
+
+
+f0t <- function(t, theta, w){
+  L = length(w)
+  t1 = theta[1]
+  t2 = theta[2]
+  suma=0
+  for(i in 1:L){
+    suma = suma + w[i]*dbeta(STheta(t=t, theta = theta), i, L-i+1)*
+      exp(-(exp(t1)*t)^(exp(t2)))* (exp(t1))^(exp(t2))*exp(t2)*t^(exp(t2)-1)
+  }
+  return(suma)
+}
+
+
+CIndex = function(Y, Delta, eta){
+  n=length(Y)
+  CINum = numeric(n)
+  CIDen = numeric(n)
+  for(i in 1:length(Y)){
+    CINum[i] = length(Y[Y[i]<Y & eta[i]>eta & Delta[i]==1 ])
+    CIDen[i] = length(Y[Y[i]<Y & Delta[i]==1])
+  }
+  return(sum(CINum)/sum(CIDen))
+}
+
+GHIndex = function(eta){
+  n=length(eta)
+  GH = numeric(n)
+  for(i in 1:n){
+    GH[i] = sum(as.numeric(eta[i]>eta)/(1+exp(eta-eta[i])))
+  }
+  return(2*sum(GH)/(n*(n-1)))
+}
+
+medianaS0t = function(sobrevida, tiempos){
+  mediana = min(tiempos[sobrevida>0.5])
+  return(mediana)
+  }
+```
+
+## Carga de Datos
+
+```{r}
+DatosACHO <- read_excel("DatosACHO.xlsx")
+```
+
+```{r, echo=FALSE}
+load(file="BoxCoxBayes.RData")
+Base = DatosACHO %>% dplyr::select(OS_Time, OS_Censor,AGE, ISOTYPE, B2M,
+                                   ALB, CREAT, LDH, HGB, ASPC, BMPC) 
+
+
+Y = Base$OS_Time
+Delta = Base$OS_Censor
+X = Base[, 3:(ncol(Base))] %>%  dplyr::select(where(is.numeric))
+perdido = 1
+X_media =X
+X_mediana = X
+p = ncol(X)
+n = nrow(X)
+for(j in 1:p){
+  for(i in 1:n){
+    if(is.na(X[i,j])){
+      X_media[i,j]=(mean(Prueba1$XPerd[,perdido])-0.1)
+      X_mediana[i,j]=(median(Prueba1$XPerd[,perdido])-0.1)
+      perdido=perdido+1
+    }
+  }
+}
+
+```
+
+```{r}
+ACHOImp = DatosACHO %>% 
+  dplyr::select(OS_Time, OS_Censor,SEX,Cyto_Abn, Medula_OD, Pet_Ct,TMO) %>% 
+  cbind(X_mediana) 
+
+modelo1 =  survreg(Surv(OS_Time, OS_Censor) ~ Pet_Ct+AGE + ISOTYPE + B2M + ALB +
+                   CREAT + LDH + HGB + ASPC + BMPC+
+                   Cyto_Abn , data=ACHOImp, dist='weibull')
+
+summary(modelo1)
+```
+
+```{r}
+#set.seed(12345)
+modeloBayesNAMediana =  survregbayes(Surv(OS_Time, OS_Censor) ~Pet_Ct+AGE  + 
+                         B2M + ALB+HGB + BMPC+
+                   Cyto_Abn, data=ACHOImp,selection = TRUE, dist='weibull')
+
+
+summary(modeloBayesNAMediana)
+Importance = t(t(rowSums(modeloBayesNAMediana$gamma)/2000)) %>%  as.data.frame() 
+Importance$variable = names(modeloBayesNAMediana$coefficients[1:7])
+p1 = Importance %>% 
+  ggplot(aes(x=fct_reorder(variable, V1), y=V1))+
+  geom_bar(stat="identity", position="dodge")+
+  theme_bw()+
+  scale_fill_manual(name="Bayes Model",
+                     labels=c("Complete", "Imputed"),
+                     values=c("gray1", "gray50"))+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  xlab("Variable") + ylab("Importance of Variable")
+
+p1
+```
+
+```{r}
+etaBayes = as.numeric(modeloBayesNAMediana$X %*% as.matrix(modeloBayesNAMediana$coefficients)[1:ncol(modeloBayesNAMediana$X.scaled)])
+
+etaCox = -modelo1$linear.predictors
+Y = as.numeric(modeloBayesNAMediana$terms$`Surv(OS_Time, OS_Censor)`)[1:nrow(modeloBayesNAMediana$X.scaled)]
+
+Delta = as.numeric(modeloBayesNAMediana$terms$`Surv(OS_Time, OS_Censor)`)[(nrow(modeloBayesNAMediana$X.scaled)+1): (2*nrow(modeloBayesNAMediana$X.scaled))]
+
+CIndex(Y, Delta, etaBayes)
+#CIndex(Y, Delta, etaCox)
+
+GHIndex(etaBayes)
+#GHIndex(etaCox)
+```
+
+```{r}
+theta0 = modeloBayesNAMediana$theta.scaled
+
+w = modeloBayesNAMediana$weight
+
+beta = modeloBayesNAMediana$beta.scaled
+
+XObs = modeloBayesNAMediana$X.scaled %*%apply(beta, 1, mean)
+
+AUCBayes = AUC.uno(modelo1$y, modelo1$y, XObs, times=seq(6,36,6))
+AUCBayes
+
+```
+
+```{r}
+
+modelo1 =  flexsurvreg(Surv(OS_Time, OS_Censor) ~ Pet_Ct+AGE  + 
+                         B2M + ALB+HGB + BMPC+
+                   Cyto_Abn , data=ACHOImp, dist='weibull')
+
+summary(modelo1)
+```
+
+```{r}
+write.csv2(ACHOImp, file="Imputacion.csv")
+```
+
+```{r}
+fit <- survfit(Surv(OS_Time, OS_Censor) ~ Pet_Ct, data = ACHOImp)
+ggsurvplot(fit, data = ACHOImp,size = 1,                 # change line size
+  palette =
+    c("#E7B800", "#2E9FDF"),# custom color palettes
+  conf.int = TRUE,          # Add confidence interval
+  pval = FALSE,              # Add p-value
+  risk.table = FALSE,        # Add risk table
+  risk.table.col = "PET",# Risk table color by groups
+  legend.labs =
+    c("Negative", "Positive"),    # Change legend labels
+  risk.table.height = 0.25, # Useful to change when you have multiple groups
+  ggtheme = theme_bw()      # Change ggplot2 theme
+)
+```
+
+```{r}
+
+set.seed(123456)
+ACHOImp$EFS_Censor = DatosACHO$EFS_Censor
+
+ACHOImp$EFS_Time = DatosACHO$EFS_Time
+
+modeloBayesNAMediana =  survregbayes(Surv(EFS_Time, EFS_Censor) ~Pet_Ct+AGE  + 
+                         B2M + ALB+HGB + BMPC+
+                   Cyto_Abn, data=ACHOImp %>% filter(EFS_Time>0),
+                   selection = TRUE, dist='weibull')
+
+
+summary(modeloBayesNAMediana)
+Importance = t(t(rowSums(modeloBayesNAMediana$gamma)/2000)) %>%  as.data.frame() 
+Importance$variable = names(modeloBayesNAMediana$coefficients[1:7])
+Importance
+```
+
+```{r}
+
+fit <- survfit(Surv(EFS_Time, EFS_Censor) ~ Pet_Ct, data = ACHOImp)
+ggsurvplot(fit, data = ACHOImp,size = 1,                 # change line size
+  palette =
+    c("#E7B800", "#2E9FDF"),# custom color palettes
+  conf.int = TRUE,          # Add confidence interval
+  pval = FALSE,              # Add p-value
+  risk.table = FALSE,        # Add risk table
+  risk.table.col = "PET",# Risk table color by groups
+  legend.labs =
+    c("Negative", "Positive"),    # Change legend labels
+  risk.table.height = 0.25, # Useful to change when you have multiple groups
+  ggtheme = theme_bw()      # Change ggplot2 theme
+)
+```
+
+## Pronosticar
+
+```{r}
+ACHOImp$TTO = DatosACHO$Response_TTO
+fit <- survfit(Surv(EFS_Time, EFS_Censor) ~ Pet_Ct+TTO, data = ACHOImp)
+ggsurvplot(fit, data = ACHOImp,size = 1,            
+  conf.int = FALSE,          # Add confidence interval
+  pval = FALSE,              # Add p-value
+  risk.table = FALSE,        # Add risk table
+  risk.table.col = "PET",# Risk table color by group,    # Change legend labels
+  risk.table.height = 0.25, # Useful to change when you have multiple groups
+  ggtheme = theme_bw()      # Change ggplot2 theme
+)
+```
+
+```{r}
+fit <- survfit(Surv(OS_Time, OS_Censor) ~ Pet_Ct+TTO, data = ACHOImp)
+ggsurvplot(fit, data = ACHOImp,size = 1,            
+  conf.int = TRUE,          # Add confidence interval
+  pval = FALSE,              # Add p-value
+  risk.table = FALSE,        # Add risk table
+  risk.table.col = "PET",# Risk table color by group,    # Change legend labels
+  risk.table.height = 0.25, # Useful to change when you have multiple groups
+  ggtheme = theme_bw()      # Change ggplot2 theme
+)
+```
+
+Por cada variable hay una cantidad muy grande de datos faltantes
+
+```{r}
+FaltantesColumna =  as.data.frame(colSums(is.na(DatosACHO))/nrow(DatosACHO))
+FaltantesColumna %>% arrange(desc(`colSums(is.na(DatosACHO))/nrow(DatosACHO)`))
+```
+
+```{r}
+FaltInd =  as.data.frame(rowSums(is.na(DatosACHO))/ncol(DatosACHO))
+FaltInd %>% arrange(desc(`rowSums(is.na(DatosACHO))/ncol(DatosACHO)`))
+```
